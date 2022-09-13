@@ -1,34 +1,71 @@
-use axum::extract::WebSocketUpgrade;
+#![allow(unused_imports)]
+
+extern crate core;
+
+use std::sync::Arc;
+
+use crate::handlers::message::*;
+use crate::handlers::user::*;
 use axum::extract::ws::{Message, WebSocket};
+use axum::extract::WebSocketUpgrade;
+use axum::middleware::AddExtension;
 use axum::response::Response;
+use axum::routing::{get, post};
+use axum::Extension;
 use axum::Router;
-use axum::routing::get;
-use serde::{Serialize,Deserialize};
+use migration::{Migrator, MigratorTrait};
+use sea_orm::ConnectOptions;
+use sea_orm::Database;
+use sea_orm::DatabaseConnection;
+use serde::{Deserialize, Serialize};
+use tower::ServiceBuilder;
+
+mod handlers;
+mod models;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", tag = "t", content = "d")]
 enum WebMessage {
-    MessageCreate { message: String, message_id: u64 },
-    MessageDelete { message_id: u64 }
+    MessageCreate(MessageCreate),
+    MessageDelete(MessageDelete),
+}
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    database_url: String,
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
+    let r = std::fs::File::open("config.yaml").unwrap();
+    let yaml: Config = serde_yaml::from_reader(r).unwrap();
+
+    // let connection: DatabaseConnection = sea_orm::Database::connect(&yaml.database_url).await?;
+    let mut opt = ConnectOptions::new(yaml.database_url.to_owned());
+    opt.max_connections(100)
+        .min_connections(5)
+        .sqlx_logging(true);
+    let connection = Database::connect(opt).await?;
+
     let app = Router::new()
         .route("/", get(|| async { "Hello, World!" }))
-        .route("/ws", get(websocket_handler));
+        .route("/user/create", post(create_user))
+        .route("/ws", get(websocket_handler))
+        .layer(ServiceBuilder::new().layer(Extension(connection)));
 
     axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
         .serve(app.into_make_service())
         .await
         .unwrap();
+
+        Ok(())
 }
 
-async fn websocket_handler(ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(handle_socket)
+async fn websocket_handler(ws: WebSocketUpgrade, Extension(connection): Extension<DatabaseConnection>) -> Response {
+    ws.on_upgrade(move | socket | handle_socket(socket, connection))
 }
 
-async fn handle_socket(mut socket: WebSocket) {
+async fn handle_socket(mut socket: WebSocket, refconnection: DatabaseConnection) {
     while let Some(msg) = socket.recv().await {
         let msg = match msg {
             Ok(msg) => msg,
@@ -36,20 +73,18 @@ async fn handle_socket(mut socket: WebSocket) {
             Err(_) => return,
         };
 
-        let parsed = match serde_json::from_slice::<WebMessage>(&msg.into_data()) {
-            Ok(parsed) => {
-                println!("{:#?}", parsed);
-                parsed
+        match serde_json::from_slice::<WebMessage>(&msg.into_data()) {
+            Ok(parsed) => match parsed {
+                WebMessage::MessageCreate(message) => message_create(message, &mut socket, connection).await,
+                WebMessage::MessageDelete(message) => message_delete(message, &mut socket, connection).await,
             },
             Err(error) => {
+                if socket.send(Message::Text(error.to_string())).await.is_err() {
+                    return;
+                };
                 socket.close().await.unwrap();
-                println!("{}\n", error);
                 return;
             }
         };
-
-        if socket.send(Message::Binary(serde_json::to_vec(&parsed).unwrap())).await.is_err() {
-            return;
-        }
     }
 }
